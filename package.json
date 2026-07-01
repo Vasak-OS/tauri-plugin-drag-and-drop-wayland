@@ -1,6 +1,6 @@
 {
   "name": "@vasakgroup/plugin-drag-and-drop-wayland",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "author": "Joaquin (Pato) Decima <jdecima@vasak.net.ar>",
   "description": "A Tauri plugin for drag-and-drop on Wayland.",
   "type": "module",
