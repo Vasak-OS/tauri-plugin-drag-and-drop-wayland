@@ -1,6 +1,6 @@
 [package]
 name = "tauri-plugin-drag-and-drop-wayland"
-version = "2.0.0"
+version = "2.0.1"
 authors = ["Joaquin (Pato) Decima <jdecima@vasak.net.ar>", "Vasak Group"]
 description = "A Tauri plugin for drag-and-drop on Wayland using GTK."
 edition = "2021"
