@@ -10,7 +10,7 @@ links = "tauri-plugin-drag-and-drop-wayland"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Vasak-OS/tauri-plugin-drag-and-drop-wayland"
 readme = "README.md"
-keywords = ["tauri", "plugin", "drag", "drop", "wayland", "gtk"]
+keywords = ["tauri", "plugin", "drag", "drop", "wayland"]
 
 [features]
 default = []
