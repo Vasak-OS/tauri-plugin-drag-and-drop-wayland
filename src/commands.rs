@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use gtk::prelude::*;
 use gtk::gdk::DragAction;
+use log::{info, warn, error};
 use tauri::{command, AppHandle, Runtime, Window};
 use tauri::ipc::Channel;
 
@@ -14,6 +15,9 @@ use crate::models::*;
 thread_local! {
     static WIDGET_CACHE: RefCell<HashMap<String, gtk::Widget>> = RefCell::new(HashMap::new());
 }
+
+const URI_TARGET_ID: u32 = 0;
+const TEXT_TARGET_ID: u32 = 1;
 
 fn find_webview_widget(window: &gtk::ApplicationWindow, window_label: &str) -> Option<gtk::Widget> {
     if let Some(cached) = WIDGET_CACHE.with(|cache| cache.borrow().get(window_label).cloned()) {
@@ -87,14 +91,14 @@ pub async fn start_drag<R: Runtime>(
         let result = match window.gtk_window() {
             Ok(w) => {
                 let drag_widget = find_webview_widget(&w, &window_id).unwrap_or_else(|| {
-                    tracing::warn!("WebKitWebView not found, falling back to ApplicationWindow");
+                    warn!("WebKitWebView not found, falling back to ApplicationWindow");
                     w.upcast::<gtk::Widget>()
                 });
-                tracing::info!("Starting drag on widget: {:?}", drag_widget.type_().name());
+                info!("Starting drag on widget: {:?}", drag_widget.type_().name());
                 do_drag(&drag_widget, files, icon_pixbuf, opts.mode, on_event)
             }
             Err(e) => {
-                tracing::error!("Failed to get GTK window: {e}");
+                error!("Failed to get GTK window: {e}");
                 Err(Error::Tauri(e))
             }
         };
@@ -118,36 +122,52 @@ fn do_drag(
 
     widget.drag_source_set(gtk::gdk::ModifierType::BUTTON1_MASK, &[], drag_action);
 
-    let is_files = file_paths.is_some();
-    if is_files {
-        widget.drag_source_add_uri_targets();
-    } else {
-        widget.drag_source_add_text_targets();
+    let target_list = gtk::TargetList::new(&[]);
+
+    if file_paths.is_some() {
+        target_list.add(&gtk::gdk::Atom::intern("text/uri-list"), 0, URI_TARGET_ID);
     }
+    target_list.add(&gtk::gdk::Atom::intern("text/plain"), 0, TEXT_TARGET_ID);
+    target_list.add(&gtk::gdk::Atom::intern("text/plain;charset=utf-8"), 0, TEXT_TARGET_ID);
+
+    widget.drag_source_set_target_list(Some(&target_list));
 
     let handler_ids: Arc<Mutex<Vec<gtk::glib::SignalHandlerId>>> =
         Arc::new(Mutex::new(vec![]));
 
     let paths = file_paths.unwrap_or_default();
-    let h = widget.connect_drag_data_get(move |_, _, data, _, _| {
-        if !paths.is_empty() {
-            let uris: Vec<String> =
-                paths.iter().map(|p| format!("file://{}", p.display())).collect();
-            let uris_refs: Vec<&str> = uris.iter().map(String::as_str).collect();
-            data.set_uris(&uris_refs);
+    let h = widget.connect_drag_data_get(move |_, _, data, info, _| {
+        if paths.is_empty() {
+            return;
+        }
+        let uris: Vec<String> =
+            paths.iter().map(|p| format!("file://{}", p.display())).collect();
+        match info {
+            URI_TARGET_ID => {
+                info!("Drag target requested: text/uri-list");
+                let uris_refs: Vec<&str> = uris.iter().map(String::as_str).collect();
+                data.set_uris(&uris_refs);
+            }
+            TEXT_TARGET_ID => {
+                info!("Drag target requested: text/plain");
+                data.set_text(&uris.join("\r\n"));
+            }
+            _ => {
+                info!("Drag target requested: unknown({})", info);
+            }
         }
     });
     handler_ids.lock().unwrap().push(h);
 
-    let target_list = widget.drag_source_get_target_list().ok_or_else(|| {
-        Error::Drag("no target list available".into())
-    })?;
+    info!("Drag targets configured");
 
     let drag_context = widget
         .drag_begin_with_coordinates(&target_list, drag_action, 1, None, -1, -1)
         .ok_or_else(|| {
             Error::Drag("failed to initiate drag".into())
         })?;
+
+    info!("Drag context created");
 
     if let Some(pixbuf) = icon {
         drag_context.drag_set_icon_pixbuf(&pixbuf, 0, 0);
@@ -157,7 +177,7 @@ fn do_drag(
     let ids = handler_ids.clone();
     let ch_drop = on_event.clone();
     drag_context.connect_drop_performed(move |_, _| {
-        tracing::info!("Drag drop performed");
+        info!("Drag drop performed");
         let _ = ch_drop.send(CallbackResult {
             result: DragResult::Dropped,
             cursor_pos: CursorPosition { x: 0.0, y: 0.0 },
@@ -168,7 +188,7 @@ fn do_drag(
     let w = widget.clone();
     let ids = handler_ids.clone();
     widget.connect_drag_failed(move |_, _, _| {
-        tracing::info!("Drag failed or was cancelled");
+        warn!("Drag failed or was cancelled");
         let _ = on_event.send(CallbackResult {
             result: DragResult::Cancelled,
             cursor_pos: CursorPosition { x: 0.0, y: 0.0 },
@@ -177,7 +197,7 @@ fn do_drag(
         gtk::glib::Propagation::Proceed
     });
 
-    tracing::info!("GDK drag initiated successfully");
+    info!("GDK drag initiated successfully");
     Ok(())
 }
 
