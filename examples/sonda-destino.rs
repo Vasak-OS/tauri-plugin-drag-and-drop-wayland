@@ -11,8 +11,17 @@ use gtk::prelude::*;
 fn main() {
     gtk::init().expect("gtk init");
 
+    // Con `--mover` acepta **sólo** `MOVE`, así el destino negocia mover y GTK le
+    // pide al origen que borre el original. Es la única forma de probar ese camino
+    // sin depender de que alguna app ajena elija mover.
+    let solo_mover = std::env::args().any(|a| a == "--mover");
+
     let ventana = gtk::Window::new(gtk::WindowType::Toplevel);
-    ventana.set_title("Soltá un archivo acá — sonda de destino");
+    ventana.set_title(if solo_mover {
+        "Soltá acá — este destino MUEVE (borra el original)"
+    } else {
+        "Soltá un archivo acá — sonda de destino"
+    });
     ventana.set_default_size(520, 200);
 
     let etiqueta = gtk::Label::new(Some("Soltá un archivo acá.\nLo que reciba se imprime en la terminal."));
@@ -28,13 +37,34 @@ fn main() {
         gtk::TargetEntry::new("text/plain", gtk::TargetFlags::OTHER_APP, 1),
         gtk::TargetEntry::new("text/plain;charset=utf-8", gtk::TargetFlags::OTHER_APP, 2),
     ];
+    // **Sin `DROP`.** Con `DestDefaults::ALL`, GTK cierra el arrastre solo llamando
+    // a `gtk_drag_finish(context, TRUE, FALSE, time)` — con el borrado en `FALSE`.
+    // O sea que `drag-data-delete` nunca llega al origen y un movimiento nunca
+    // termina de moverse. Medido: el destino negociaba `MOVE`, recibía los datos, y
+    // el archivo seguía en su lugar. Un destino que mueve de verdad tiene que
+    // cerrarlo él, que es lo que hace Nautilus.
     caja.drag_dest_set(
-        gtk::DestDefaults::ALL,
+        gtk::DestDefaults::MOTION | gtk::DestDefaults::HIGHLIGHT,
         &objetivos,
-        gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE,
+        if solo_mover {
+            gtk::gdk::DragAction::MOVE
+        } else {
+            gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE
+        },
     );
 
-    caja.connect_drag_data_received(|_, contexto, _, _, datos, info, _| {
+    // Sin `DROP` hay que pedir los datos a mano cuando se suelta.
+    caja.connect_drag_drop(|widget, contexto, _, _, tiempo| {
+        let objetivo = widget
+            .drag_dest_find_target(contexto, None)
+            .unwrap_or_else(|| gtk::gdk::Atom::intern("text/uri-list"));
+        println!("soltado: se piden los datos de {}", objetivo.name());
+        widget.drag_get_data(contexto, &objetivo, tiempo);
+        // `drag-drop` devuelve un bool: `true` = «me hago cargo yo».
+        true
+    });
+
+    caja.connect_drag_data_received(move |_, contexto, _, _, datos, info, tiempo| {
         let mime = datos.data_type().name();
         println!();
         println!("── recibido ──");
@@ -69,6 +99,12 @@ fn main() {
                 }
             }
         }
+
+        // El cierre, a mano. El tercer argumento es el que le pide al origen que
+        // borre el original: sin él en `true`, un movimiento se queda a medias.
+        let mover = contexto.selected_action().contains(gtk::gdk::DragAction::MOVE);
+        println!("  cerrando: éxito=true borrar_origen={mover}");
+        contexto.drag_finish(true, mover, tiempo);
     });
 
     ventana.connect_delete_event(|_, _| {
@@ -77,6 +113,10 @@ fn main() {
     });
 
     ventana.show_all();
-    println!("destino listo: arrastrale un archivo desde el gestor");
+    if solo_mover {
+        println!("destino listo (SÓLO MOVER): lo que sueltes se le pide borrar al origen");
+    } else {
+        println!("destino listo: arrastrale un archivo desde el gestor");
+    }
     gtk::main();
 }

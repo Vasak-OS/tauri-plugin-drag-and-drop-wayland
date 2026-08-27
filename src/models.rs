@@ -22,12 +22,17 @@ pub enum SharedData {
     Map(HashMap<String, String>),
 }
 
+/// El icono del arrastre: una ruta absoluta o el contenido en base64.
+///
+/// Una sola variante a propósito. Antes eran dos —`Base64(String)` y
+/// `Raw(String)`— bajo `#[serde(untagged)]`, que prueba en orden y se queda con la
+/// primera que encaje: las dos encajan con cualquier cadena, así que `Raw` era
+/// **inalcanzable** y una ruta se intentaba decodificar como base64. El arrastre
+/// nunca tuvo icono. Cuál de las dos cosas es lo decide el contenido, en
+/// `commands::cargar_icono`, que es donde se puede mirar el disco.
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum Image {
-    Base64(String),
-    Raw(String),
-}
+#[serde(transparent)]
+pub struct Image(pub String);
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -74,30 +79,49 @@ pub struct CallbackResult {
 }
 
 #[cfg(test)]
-mod diagnostico {
+mod tests {
     use super::*;
 
     #[test]
-    fn una_ruta_de_icono_se_lee_como_base64() {
-        // `#[serde(untagged)]` prueba las variantes **en orden** y se queda con la
-        // primera que encaje. `Base64(String)` y `Raw(String)` encajan las dos con
-        // cualquier cadena, así que `Raw` es inalcanzable: una ruta de archivo
-        // —que es lo que manda el gestor de archivos— se intenta decodificar como
-        // base64, falla, y el arrastre nunca tiene icono.
-        let como_json = serde_json::from_str::<Image>(r#""/usr/share/icons/x/32x32.png""#)
-            .expect("deserializa");
-        match como_json {
-            Image::Base64(v) => println!("SE LEYÓ COMO BASE64: {v}"),
-            Image::Raw(v) => panic!("se leyó como ruta: {v}"),
+    fn el_icono_llega_como_una_sola_cosa() {
+        // Una ruta y un base64 son los dos una cadena, y no hay forma de que serde
+        // los distinga: por eso hay una variante y no dos. Antes eran dos bajo
+        // `untagged` y la segunda era inalcanzable.
+        let ruta: Image = serde_json::from_str(r#""/usr/share/icons/x.png""#).expect("ruta");
+        assert_eq!(ruta.0, "/usr/share/icons/x.png");
+        let b64: Image = serde_json::from_str(r#""iVBORw0KGgo=""#).expect("base64");
+        assert_eq!(b64.0, "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn los_datos_sueltos_conservan_sus_tipos_y_su_contenido() {
+        // La API de JS los ofrece; antes el lado Rust los descartaba y el arrastre
+        // salía sin nada.
+        let d: DragItem = serde_json::from_str(
+            r#"{"data":{"text/plain":"llano","text/html":"<b>rico</b>"},"types":["text/plain","text/html"]}"#,
+        )
+        .expect("deserializa");
+
+        match d {
+            DragItem::Data { data, mime_types } => {
+                assert_eq!(mime_types, vec!["text/plain", "text/html"]);
+                match data {
+                    SharedData::Map(m) => {
+                        assert_eq!(m.get("text/plain").map(String::as_str), Some("llano"));
+                        assert_eq!(m.get("text/html").map(String::as_str), Some("<b>rico</b>"));
+                    }
+                    otro => panic!("{otro:?}"),
+                }
+            }
+            otro => panic!("{otro:?}"),
         }
     }
 
     #[test]
-    fn los_datos_sueltos_se_aceptan_y_se_descartan() {
-        // La API de JS ofrece `{ data, types }`, y el lado Rust lo convierte en
-        // `None` y no hace nada: el arrastre sale sin ningún contenido.
-        let d: DragItem = serde_json::from_str(r#"{"data":"hola","types":["text/plain"]}"#)
-            .expect("deserializa");
-        assert!(matches!(d, DragItem::Data { .. }));
+    fn una_lista_de_rutas_se_lee_como_archivos_y_no_como_datos() {
+        // `untagged` prueba en orden: si `Data` estuviera primero, un arreglo de
+        // cadenas podría entrar por el lado equivocado.
+        let d: DragItem = serde_json::from_str(r#"["/tmp/a.txt"]"#).expect("deserializa");
+        assert!(matches!(d, DragItem::Files(_)));
     }
 }
