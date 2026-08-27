@@ -1,23 +1,110 @@
+//! Arrastrar hacia afuera de la aplicación, en Wayland.
+//!
+//! # Por qué esto no es un comando y medio
+//!
+//! Un comando de Tauri no puede arrancar un arrastre. `gtk_drag_begin` necesita
+//! estar **dentro del despacho de un evento**: usa `gtk_get_current_event()` para
+//! sacar el dispositivo y el serial del agarre implícito del ratón, y en Wayland
+//! `wl_data_device.start_drag` sin ese serial es una petición que el compositor
+//! descarta. Un comando corre en `run_on_main_thread`, o sea en una devolución del
+//! bucle principal, donde no hay evento actual.
+//!
+//! Medido con dos sondas —`examples/sonda-wayland.rs` y
+//! `examples/sonda-con-evento.rs`— sobre Wayfire:
+//!
+//! * Desde un `idle`, `drag_begin_with_coordinates` devuelve `None` con cualquier
+//!   widget: `GtkBox`, `GtkEventBox` y el toplevel, los tres igual, con un
+//!   `Gdk-CRITICAL` sobre `gdk_wayland_window_get_wl_surface`.
+//! * Dentro de un manejador de movimiento, con el botón apretado, devuelve un
+//!   contexto — y da igual si se le pasa el evento o `None`, porque GTK lo saca
+//!   del evento actual.
+//!
+//! Así que el comando **arma** el arrastre y quien lo dispara es un manejador de
+//! `motion-notify-event`, que sí corre dentro de un evento. Entre el gesto y el
+//! arrastre no queda ningún salto asíncrono.
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
-use gtk::prelude::*;
 use gtk::gdk::DragAction;
-use log::{info, warn, error};
-use tauri::{command, AppHandle, Runtime, Window};
+use gtk::prelude::*;
+use log::{debug, info, warn};
 use tauri::ipc::Channel;
+use tauri::{command, AppHandle, Runtime, Window};
 
 use crate::error::Error;
 use crate::models::*;
+use crate::uri;
 
-thread_local! {
-    static WIDGET_CACHE: RefCell<HashMap<String, gtk::Widget>> = RefCell::new(HashMap::new());
+/// Cuánto vale un arrastre armado antes de darse por perdido.
+///
+/// Entre el gesto del ratón y el comando hay un viaje de IPC; si en el medio se
+/// suelta el botón, el manejador nunca lo dispara y el armado quedaría colgado
+/// para el próximo movimiento, arrancando un arrastre que nadie pidió. Pasado el
+/// plazo se cancela y se avisa, que es mejor que quedarse en silencio.
+const VALIDEZ_DEL_ARMADO_MS: u32 = 1500;
+
+/// Lo que se identifica como `text/uri-list`.
+const URI_TARGET_ID: u32 = 0;
+/// Lo que se identifica como texto plano.
+const TEXT_TARGET_ID: u32 = 1;
+/// El primer identificador para los tipos MIME propios de un arrastre de datos.
+const PRIMER_TARGET_PROPIO: u32 = 2;
+
+/// Lo que se va a entregar cuando el destino lo pida.
+#[derive(Debug, Clone)]
+pub enum Contenido {
+    /// Archivos: los URIs codificados para `text/uri-list` **y** las rutas tal
+    /// cual para `text/plain`. Hacen falta las dos: un destino de texto pega lo
+    /// que recibe, y un URI codificado pegado no es ningún archivo.
+    Uris {
+        uris: Vec<String>,
+        rutas: Vec<PathBuf>,
+    },
+    /// Datos sueltos: para cada identificador, su tipo MIME y su texto.
+    Datos(Vec<(u32, String, String)>),
 }
 
-const URI_TARGET_ID: u32 = 0;
-const TEXT_TARGET_ID: u32 = 1;
+/// Un arrastre pedido por la interfaz, esperando el próximo movimiento del ratón.
+struct Armado {
+    contenido: Contenido,
+    icono: Option<gdk_pixbuf::Pixbuf>,
+    accion: DragAction,
+    canal: Channel<CallbackResult>,
+    /// Para que el temporizador de vencimiento no cancele a otro.
+    ///
+    /// Sin esto, dos arrastres armados dentro de la ventana de validez chocan: el
+    /// temporizador del primero se lleva puesto el segundo, que estaba a punto de
+    /// dispararse.
+    ficha: u64,
+}
+
+/// Un arrastre en curso, con lo que hay que entregar y a quién avisarle.
+struct EnCurso {
+    contenido: Contenido,
+    canal: Channel<CallbackResult>,
+    /// Dónde estaba el puntero al arrancar, en coordenadas de la pantalla.
+    ///
+    /// Se informa en el callback. Antes se mandaba `{0, 0}` siempre, o sea que el
+    /// campo existía en la API y no decía nada: quien lo usara para ubicar un menú
+    /// lo abría en la esquina.
+    cursor: CursorPosition,
+    /// Si ya se avisó el final. `drag-failed` y `drag-end` pueden llegar los dos.
+    avisado: bool,
+    /// Si llegó `drag-data-delete`. **Sólo pasa en X11.**
+    piden_borrar: bool,
+    /// Si llegó `drag-failed`, o sea si el destino no se quedó con nada.
+    fallo: bool,
+}
+
+thread_local! {
+    static ARMADO: RefCell<Option<Armado>> = const { RefCell::new(None) };
+    static EN_CURSO: RefCell<Option<EnCurso>> = const { RefCell::new(None) };
+    static WIDGET_CACHE: RefCell<HashMap<String, gtk::Widget>> = RefCell::new(HashMap::new());
+    /// El contador de fichas de los arrastres armados.
+    static PROXIMA_FICHA: RefCell<u64> = const { RefCell::new(0) };
+}
 
 fn find_webview_widget(window: &gtk::ApplicationWindow, window_label: &str) -> Option<gtk::Widget> {
     if let Some(cached) = WIDGET_CACHE.with(|cache| cache.borrow().get(window_label).cloned()) {
@@ -25,7 +112,10 @@ fn find_webview_widget(window: &gtk::ApplicationWindow, window_label: &str) -> O
             return Some(cached);
         }
     }
-    let found = find_widget_by_type_name(&window.clone().upcast::<gtk::Container>(), "WebKitWebView");
+    let found = find_widget_by_type_name(
+        &window.clone().upcast::<gtk::Container>(),
+        "WebKitWebView",
+    );
     if let Some(ref w) = found {
         WIDGET_CACHE.with(|cache| cache.borrow_mut().insert(window_label.to_string(), w.clone()));
     }
@@ -53,11 +143,382 @@ fn load_pixbuf_from_data(data: &[u8]) -> Option<gdk_pixbuf::Pixbuf> {
     loader.pixbuf()
 }
 
-fn load_pixbuf_from_path(path: &PathBuf) -> Option<gdk_pixbuf::Pixbuf> {
-    let data = std::fs::read(path).ok()?;
-    load_pixbuf_from_data(&data)
+/// Carga el icono del arrastre, sea una ruta o base64.
+///
+/// Lo decide el contenido y no quien llama: por el puente llega una cadena, y una
+/// ruta y un base64 son las dos una cadena. Antes se intentaba distinguirlas con un
+/// enum `untagged` de dos variantes de `String`, que serde resuelve siempre por la
+/// primera: una ruta —lo que manda el gestor de archivos— se decodificaba como
+/// base64, fallaba, y el arrastre nunca tenía icono.
+pub fn cargar_icono(valor: &str) -> Option<gdk_pixbuf::Pixbuf> {
+    let ruta = PathBuf::from(valor);
+    if ruta.is_absolute() && ruta.is_file() {
+        if let Ok(datos) = std::fs::read(&ruta) {
+            return load_pixbuf_from_data(&datos);
+        }
+        warn!("no se pudo leer el icono de arrastre: {valor}");
+        return None;
+    }
+
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, valor)
+        .ok()
+        .and_then(|bytes| load_pixbuf_from_data(&bytes))
 }
 
+/// Convierte lo que pidió la interfaz en lo que se va a entregar.
+///
+/// Los datos sueltos se implementan de verdad: la API de JS los ofrecía y el lado
+/// Rust los convertía en `None`, así que el arrastre salía sin nada.
+pub fn contenido_de(item: DragItem) -> Contenido {
+    match item {
+        DragItem::Files(rutas) => {
+            let validas: Vec<(String, PathBuf)> = rutas
+                .into_iter()
+                .filter_map(|r| match uri::de_ruta(&r) {
+                    Some(u) => Some((u, r)),
+                    None => {
+                        warn!("se descarta una ruta que no da un URI: {}", r.display());
+                        None
+                    }
+                })
+                .collect();
+            let (uris, rutas) = validas.into_iter().unzip();
+            Contenido::Uris { uris, rutas }
+        }
+        DragItem::Data { data, mime_types } => {
+            let textos: Vec<String> = match data {
+                SharedData::Fixed(t) => mime_types.iter().map(|_| t.clone()).collect(),
+                SharedData::Map(m) => mime_types
+                    .iter()
+                    .map(|t| m.get(t).cloned().unwrap_or_default())
+                    .collect(),
+            };
+            Contenido::Datos(
+                mime_types
+                    .into_iter()
+                    .zip(textos)
+                    .enumerate()
+                    .map(|(i, (mime, texto))| (PRIMER_TARGET_PROPIO + i as u32, mime, texto))
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Las acciones que se le ofrecen al destino.
+///
+/// **Las dos siempre**, aunque quien llama pida una. En Wayland el destino elige
+/// entre las que el origen ofrece, y si no hay ninguna en común el compositor
+/// cancela el arrastre en lugar de entregarlo: pidiendo sólo `MOVE`, arrastrar a
+/// un editor o a un navegador —que aceptan copiar y no mover— mostraba el borde
+/// punteado del destino y después fallaba con `GDK_DRAG_CANCEL_ERROR`, sin que
+/// llegara a pedirse un solo byte. Medido con el gestor de archivos.
+///
+/// **`modo` no tiene ningún efecto sobre lo que se ofrece, y no puede tenerlo.**
+/// `DragAction` es una máscara de bits sin orden, y GTK 3 no expone forma de
+/// declararle al destino una acción preferida: la elige él. El parámetro se
+/// conserva porque es lo que la interfaz usa para dibujar la insignia de copiar o
+/// mover mientras el puntero está adentro de la ventana, que es un asunto distinto.
+pub fn acciones_de(modo: DragMode) -> DragAction {
+    let _ = modo;
+    DragAction::COPY | DragAction::MOVE
+}
+
+/// Qué tipos se le ofrecen al destino, y con qué identificador cada uno.
+///
+/// Separado de armar la `TargetList` para poder probarlo: `Atom::intern` exige GTK
+/// inicializado en el hilo principal, así que una prueba unitaria no puede tocarlo
+/// — y esta lista es justo lo que decide si arrastrar a una terminal hace algo.
+pub fn objetivos_de(contenido: &Contenido) -> Vec<(String, u32)> {
+    match contenido {
+        // El texto además de los URIs: un campo de texto o una terminal aceptan
+        // `text/plain` y no `text/uri-list`. Ofreciendo sólo uno, arrastrar ahí no
+        // hace nada.
+        Contenido::Uris { .. } => vec![
+            ("text/uri-list".to_string(), URI_TARGET_ID),
+            ("text/plain".to_string(), TEXT_TARGET_ID),
+            ("text/plain;charset=utf-8".to_string(), TEXT_TARGET_ID),
+        ],
+        Contenido::Datos(entradas) => entradas
+            .iter()
+            .map(|(id, mime, _)| (mime.clone(), *id))
+            .collect(),
+    }
+}
+
+/// La lista de objetivos que se le ofrece al destino.
+fn lista_de_objetivos(contenido: &Contenido) -> gtk::TargetList {
+    let lista = gtk::TargetList::new(&[]);
+    for (mime, id) in objetivos_de(contenido) {
+        lista.add(&gtk::gdk::Atom::intern(&mime), 0, id);
+    }
+    lista
+}
+
+/// El nombre de la acción que negoció el destino.
+///
+/// `MOVE` primero: si por algún motivo llegaran las dos, informar la más fuerte es
+/// lo honesto. Igual no es esto lo que autoriza borrar —eso es `drag-data-delete`—
+/// así que equivocarse acá no cuesta un archivo.
+pub fn nombre_de_accion(accion: DragAction) -> Option<&'static str> {
+    if accion.contains(DragAction::MOVE) {
+        Some("move")
+    } else if accion.contains(DragAction::COPY) {
+        Some("copy")
+    } else {
+        None
+    }
+}
+
+/// Si el origen tiene que sacar de su lugar lo que entregó.
+///
+/// **En Wayland no hay ninguna señal que lo pida.** `gtk_drag_finish(..., del=TRUE,
+/// ...)` implementa el borrado pidiendo el target `DELETE` por el mecanismo de
+/// selecciones de X11, que en Wayland no existe: el protocolo no tiene forma de
+/// decirle al origen «borrá el original». Medido — el destino cerraba con
+/// `borrar_origen=true` y `drag-data-delete` no llegaba nunca. Fiarse sólo de esa
+/// señal es, en Wayland, no mover nunca.
+///
+/// Lo que sí hay es el par que define el protocolo: `wl_data_source.dnd_finished`
+/// cuando el destino confirmó que recibió los datos, y `wl_data_source.cancelled`
+/// cuando no. GTK los traduce a `drag-end` y `drag-failed`. Así que «terminó sin
+/// fallar y la acción negociada fue mover» es exactamente «el destino se quedó con
+/// esto y le toca al origen sacarlo de acá».
+///
+/// El fallo manda sobre todo lo demás: si el destino no se quedó con nada, borrar
+/// sería perder un archivo que no está en ninguna otra parte.
+pub fn debe_borrar_el_origen(fallo: bool, pidieron_borrar: bool, accion: DragAction) -> bool {
+    if fallo {
+        return false;
+    }
+    pidieron_borrar || accion.contains(DragAction::MOVE)
+}
+
+/// Avisa el final del arrastre una sola vez.
+fn avisar(resultado: DragResult, accion: Option<DragAction>) {
+    EN_CURSO.with(|c| {
+        if let Some(curso) = c.borrow_mut().as_mut() {
+            if curso.avisado {
+                return;
+            }
+            curso.avisado = true;
+            let borrar = accion.is_some_and(|a| {
+                debe_borrar_el_origen(curso.fallo, curso.piden_borrar, a)
+            });
+            let _ = curso.canal.send(CallbackResult {
+                result: resultado,
+                action: accion.and_then(nombre_de_accion).map(str::to_string),
+                source_should_delete: borrar,
+                cursor_pos: curso.cursor.clone(),
+            });
+        }
+    });
+}
+
+/// La marca que se le deja al widget para no engancharlo dos veces.
+const MARCA_DE_ENGANCHE: &str = "vsk-dnd-enganchado";
+
+/// Pone los manejadores de un widget, una sola vez.
+///
+/// Se enganchan una vez y **nunca se desconectan**. La versión anterior los
+/// conectaba en cada arrastre y sólo desconectaba algunos: el `drag-failed` se
+/// filtraba, así que el enésimo arrastre cancelado mandaba N avisos. Y desconectar
+/// `drag-data-get` al terminar era peor todavía, porque en Wayland el destino pide
+/// los datos **después** del drop.
+///
+/// La marca va en el **widget** y no en la etiqueta de la ventana. Con la etiqueta,
+/// si el WebKitWebView se reemplaza —una recarga, una ventana que se recrea con el
+/// mismo nombre— la ventana ya figuraba como enganchada y el widget nuevo se
+/// quedaba sin manejadores: el arrastre dejaba de funcionar sin que nada lo dijera.
+fn enganchar(widget: &gtk::Widget) {
+    // Seguro porque el dato se escribe y se lee siempre desde el hilo principal de
+    // GTK, y el tipo es el mismo en los dos lados.
+    let ya = unsafe { widget.data::<bool>(MARCA_DE_ENGANCHE).is_some() };
+    if ya {
+        return;
+    }
+    unsafe { widget.set_data(MARCA_DE_ENGANCHE, true) };
+
+    // El que dispara. Es la única forma de que `drag_begin` corra dentro de un
+    // evento, que es lo que Wayland exige.
+    widget.connect_motion_notify_event(|w, evento| {
+        let apretado = evento
+            .state()
+            .contains(gtk::gdk::ModifierType::BUTTON1_MASK);
+
+        let armado = ARMADO.with(|a| {
+            if a.borrow().is_none() {
+                return None;
+            }
+            // Sin el botón apretado no hay agarre implícito, así que el compositor
+            // descartaría el arrastre. Se cancela y se avisa.
+            if !apretado {
+                return a.borrow_mut().take().map(Err);
+            }
+            a.borrow_mut().take().map(Ok)
+        });
+
+        match armado {
+            None => {}
+            Some(Err(perdido)) => {
+                debug!("el botón se soltó antes de arrancar el arrastre");
+                let (x, y) = evento.root();
+                let _ = perdido.canal.send(CallbackResult {
+                    result: DragResult::Cancelled,
+                    action: None,
+                    source_should_delete: false,
+                    cursor_pos: CursorPosition { x, y },
+                });
+            }
+            Some(Ok(listo)) => {
+                // La posición del evento que dispara el arrastre, en coordenadas de
+                // pantalla: es la que sirve para ubicar algo donde está el puntero.
+                let (x, y) = evento.root();
+                arrancar(
+                    w.upcast_ref::<gtk::Widget>(),
+                    listo,
+                    CursorPosition { x, y },
+                )
+            }
+        }
+
+        gtk::glib::Propagation::Proceed
+    });
+
+    // Sirve los datos cuando el destino los pide, que en Wayland es **después** del
+    // drop. Queda conectado para siempre: desconectarlo al terminar el arrastre
+    // dejaba la transferencia sin quien la atendiera y el destino recibía vacío.
+    widget.connect_drag_data_get(|_, _, data, info, _| {
+        EN_CURSO.with(|c| {
+            let prestado = c.borrow();
+            let Some(curso) = prestado.as_ref() else {
+                warn!("piden datos de arrastre y no hay ninguno en curso");
+                return;
+            };
+            // `set_text` y `set_uris` devuelven si pudieron. Ignorarlo es cómo se
+            // llega a un arrastre que se ve bien y entrega vacío sin decir nada.
+            let puesto = match &curso.contenido {
+                Contenido::Uris { uris, rutas } => match info {
+                    URI_TARGET_ID => {
+                        let refs: Vec<&str> = uris.iter().map(String::as_str).collect();
+                        data.set_uris(&refs)
+                    }
+                    // Las rutas tal cual, no los URIs: quien toma `text/plain` pega
+                    // lo que recibe, y un URI codificado pegado no es un archivo.
+                    TEXT_TARGET_ID => data.set_text(&uri::rutas_como_texto(rutas)),
+                    otro => {
+                        debug!("objetivo desconocido: {otro}");
+                        return;
+                    }
+                },
+                Contenido::Datos(entradas) => {
+                    match entradas.iter().find(|(id, _, _)| *id == info) {
+                        Some((_, _, texto)) => data.set_text(texto),
+                        None => {
+                            debug!("objetivo desconocido: {info}");
+                            return;
+                        }
+                    }
+                }
+            };
+            if puesto {
+                debug!("datos entregados para el objetivo {info}");
+            } else {
+                warn!("no se pudieron poner los datos del arrastre (objetivo {info})");
+            }
+        });
+    });
+
+    widget.connect_drag_failed(|_, contexto, motivo| {
+        // Se anota **antes** de avisar: `drag-failed` llega antes que `drag-end`, y
+        // es lo único que distingue «el destino se quedó con esto» de «no pasó
+        // nada». Sin la marca, un arrastre cancelado con la acción en mover haría
+        // borrar un archivo que nadie copió a ninguna parte.
+        EN_CURSO.with(|c| {
+            if let Some(curso) = c.borrow_mut().as_mut() {
+                curso.fallo = true;
+            }
+        });
+        debug!(
+            "arrastre cancelado: {motivo:?} (acción elegida {:?}, ofrecidas {:?})",
+            contexto.selected_action(),
+            contexto.actions()
+        );
+        avisar(DragResult::Cancelled, Some(contexto.selected_action()));
+        gtk::glib::Propagation::Proceed
+    });
+
+    // El destino pidió el borrado del original: es la señal de que la entrega
+    // salió bien y que el movimiento le toca al origen. Se anota y se informa en
+    // `drag-end`; borrar archivos del usuario no es cosa de un plugin de arrastre.
+    widget.connect_drag_data_delete(|_, _| {
+        EN_CURSO.with(|c| {
+            if let Some(curso) = c.borrow_mut().as_mut() {
+                curso.piden_borrar = true;
+            }
+        });
+        debug!("el destino pidió borrar el original (X11)");
+    });
+
+    // `drag-end` es el final de verdad, y llega **después** de que se entregaron
+    // los datos. Acá sí se puede soltar todo.
+    widget.connect_drag_end(|_, contexto| {
+        let accion = contexto.selected_action();
+        avisar(DragResult::Dropped, Some(accion));
+        debug!(
+            "¿hay que sacar el original de su lugar?: {}",
+            EN_CURSO.with(|c| c
+                .borrow()
+                .as_ref()
+                .is_some_and(|x| debe_borrar_el_origen(x.fallo, x.piden_borrar, accion)))
+        );
+        EN_CURSO.with(|c| *c.borrow_mut() = None);
+        debug!("arrastre terminado (acción {accion:?})");
+    });
+}
+
+/// Arranca el arrastre. Corre **dentro** del manejador de movimiento.
+fn arrancar(widget: &gtk::Widget, listo: Armado, cursor: CursorPosition) {
+    let lista = lista_de_objetivos(&listo.contenido);
+
+    EN_CURSO.with(|c| {
+        *c.borrow_mut() = Some(EnCurso {
+            contenido: listo.contenido.clone(),
+            canal: listo.canal.clone(),
+            cursor,
+            avisado: false,
+            piden_borrar: false,
+            fallo: false,
+        })
+    });
+
+    // Sin `drag_source_set`: no hace falta para `drag_begin`, y aplicárselo al
+    // widget de WebKit le borra la configuración de arrastre que es suya.
+    match widget.drag_begin_with_coordinates(&lista, listo.accion, 1, None, -1, -1) {
+        Some(contexto) => {
+            if let Some(pixbuf) = listo.icono {
+                contexto.drag_set_icon_pixbuf(&pixbuf, 0, 0);
+            }
+            info!(
+                "arrastre iniciado (acciones ofrecidas {:?})",
+                contexto.actions()
+            );
+        }
+        None => {
+            // No debería pasar desde acá, pero si pasa hay que decirlo: en silencio
+            // parece que el arrastre salió y no llegó nunca.
+            warn!("GTK no pudo iniciar el arrastre");
+            avisar(DragResult::Cancelled, None);
+            EN_CURSO.with(|c| *c.borrow_mut() = None);
+        }
+    }
+}
+
+/// Arma un arrastre para que lo dispare el próximo movimiento del ratón.
+///
+/// Se llama con el botón **todavía apretado**: es lo que hace que el compositor
+/// acepte el arrastre. Si se soltó en el camino, se cancela y se avisa por el
+/// canal en lugar de quedarse en silencio.
 #[command]
 pub async fn start_drag<R: Runtime>(
     app: AppHandle<R>,
@@ -68,146 +529,330 @@ pub async fn start_drag<R: Runtime>(
     on_event: Channel<CallbackResult>,
 ) -> Result<()> {
     let opts = options.unwrap_or_default();
-    let window_id = window.label().to_string();
-    let files = match item {
-        DragItem::Files(paths) => Some(paths),
-        DragItem::Data { .. } => None,
-    };
+    let etiqueta = window.label().to_string();
+    let contenido = contenido_de(item);
+    let accion = acciones_de(opts.mode);
 
     let (tx, rx) = std::sync::mpsc::channel();
 
     app.run_on_main_thread(move || {
-        let icon_pixbuf = image.as_ref().and_then(|img| match img {
-            Image::Base64(data) => {
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
-                    .ok()
-                    .and_then(|bytes| load_pixbuf_from_data(&bytes))
-            }
-            Image::Raw(path) => {
-                let p = PathBuf::from(path);
-                load_pixbuf_from_path(&p)
-            }
-        });
-        let result = match window.gtk_window() {
+        let resultado = match window.gtk_window() {
             Ok(w) => {
-                let drag_widget = find_webview_widget(&w, &window_id).unwrap_or_else(|| {
-                    warn!("WebKitWebView not found, falling back to ApplicationWindow");
+                let widget = find_webview_widget(&w, &etiqueta).unwrap_or_else(|| {
+                    warn!("no se encontró el WebKitWebView; se usa la ventana");
                     w.upcast::<gtk::Widget>()
                 });
-                info!("Starting drag on widget: {:?}", drag_widget.type_().name());
-                do_drag(&drag_widget, files, icon_pixbuf, opts.mode, on_event)
+                enganchar(&widget);
+
+                let icono = image.as_ref().and_then(|img| cargar_icono(&img.0));
+
+                let ficha = PROXIMA_FICHA.with(|f| {
+                    let mut f = f.borrow_mut();
+                    *f += 1;
+                    *f
+                });
+
+                ARMADO.with(|a| {
+                    *a.borrow_mut() = Some(Armado {
+                        contenido,
+                        icono,
+                        accion,
+                        canal: on_event.clone(),
+                        ficha,
+                    })
+                });
+
+                // Si el movimiento no llega, no se queda armado esperando a un
+                // gesto que nadie pidió.
+                gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(VALIDEZ_DEL_ARMADO_MS as u64),
+                    move || {
+                        // Sólo se lleva el suyo: dentro de la ventana de validez
+                        // puede haberse armado otro, y cancelarlo sería matar un
+                        // arrastre que estaba a punto de dispararse.
+                        let propio = ARMADO.with(|a| {
+                            let coincide =
+                                a.borrow().as_ref().is_some_and(|x| x.ficha == ficha);
+                            if coincide { a.borrow_mut().take() } else { None }
+                        });
+                        if let Some(perdido) = propio {
+                            debug!("el arrastre armado venció sin que llegara un movimiento");
+                            // Sin posición: venció sin que llegara ningún
+                            // movimiento, así que no hubo evento del que sacarla.
+                            let _ = perdido.canal.send(CallbackResult {
+                                result: DragResult::Cancelled,
+                                action: None,
+                                source_should_delete: false,
+                                cursor_pos: CursorPosition { x: 0.0, y: 0.0 },
+                            });
+                        }
+                    },
+                );
+
+                Ok(())
             }
-            Err(e) => {
-                error!("Failed to get GTK window: {e}");
-                Err(Error::Tauri(e))
-            }
+            Err(e) => Err(Error::Tauri(e)),
         };
-        let _ = tx.send(result);
-    }).map_err(Error::Tauri)?;
+        let _ = tx.send(resultado);
+    })
+    .map_err(Error::Tauri)?;
 
-    rx.recv().map_err(|e| Error::Drag(format!("drag result channel closed: {e}")))?
+    rx.recv()
+        .map_err(|e| Error::Drag(format!("drag result channel closed: {e}")))?
 }
 
-fn do_drag(
-    widget: &gtk::Widget,
-    file_paths: Option<Vec<PathBuf>>,
-    icon: Option<gdk_pixbuf::Pixbuf>,
-    mode: DragMode,
-    on_event: Channel<CallbackResult>,
-) -> Result<()> {
-    let drag_action = match mode {
-        DragMode::Copy => DragAction::COPY,
-        DragMode::Move => DragAction::MOVE,
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    widget.drag_source_set(gtk::gdk::ModifierType::BUTTON1_MASK, &[], drag_action);
-
-    let target_list = gtk::TargetList::new(&[]);
-
-    if file_paths.is_some() {
-        target_list.add(&gtk::gdk::Atom::intern("text/uri-list"), 0, URI_TARGET_ID);
+    fn item(json: &str) -> DragItem {
+        serde_json::from_str(json).expect("deserializa")
     }
-    target_list.add(&gtk::gdk::Atom::intern("text/plain"), 0, TEXT_TARGET_ID);
-    target_list.add(&gtk::gdk::Atom::intern("text/plain;charset=utf-8"), 0, TEXT_TARGET_ID);
 
-    widget.drag_source_set_target_list(Some(&target_list));
-
-    let handler_ids: Arc<Mutex<Vec<gtk::glib::SignalHandlerId>>> =
-        Arc::new(Mutex::new(vec![]));
-
-    let paths = file_paths.unwrap_or_default();
-    let h = widget.connect_drag_data_get(move |_, _, data, info, _| {
-        if paths.is_empty() {
-            return;
+    #[test]
+    fn las_rutas_se_vuelven_uris_codificados() {
+        // Antes salían como `file:///...` sin codificar, así que cualquier nombre
+        // con un espacio era un URI inválido y el destino lo rechazaba.
+        let c = contenido_de(item(r#"["/tmp/mi archivo.txt","/tmp/otro.png"]"#));
+        match c {
+            Contenido::Uris { uris, rutas } => {
+                assert_eq!(uris[0], "file:///tmp/mi%20archivo.txt");
+                assert_eq!(uris[1], "file:///tmp/otro.png");
+                // Y las rutas tal cual, que son las que van a `text/plain`.
+                assert_eq!(rutas[0], std::path::PathBuf::from("/tmp/mi archivo.txt"));
+            }
+            otro => panic!("{otro:?}"),
         }
-        let uris: Vec<String> =
-            paths.iter().map(|p| format!("file://{}", p.display())).collect();
-        match info {
-            URI_TARGET_ID => {
-                info!("Drag target requested: text/uri-list");
-                let uris_refs: Vec<&str> = uris.iter().map(String::as_str).collect();
-                data.set_uris(&uris_refs);
+    }
+
+    #[test]
+    fn una_ruta_que_no_da_uri_se_descarta_sin_llevarse_las_demas() {
+        // Una relativa no sirve para un `text/uri-list`, pero perder el arrastre
+        // entero por una sería peor.
+        let c = contenido_de(item(r#"["relativa.txt","/tmp/buena.png"]"#));
+        match c {
+            Contenido::Uris { uris, rutas } => {
+                assert_eq!(uris, vec!["file:///tmp/buena.png".to_string()]);
+                // Las dos listas quedan alineadas: si no, `text/plain` entregaría
+                // la ruta de un archivo distinto del que dice `text/uri-list`.
+                assert_eq!(rutas, vec![std::path::PathBuf::from("/tmp/buena.png")]);
             }
-            TEXT_TARGET_ID => {
-                info!("Drag target requested: text/plain");
-                data.set_text(&uris.join("\r\n"));
-            }
-            _ => {
-                info!("Drag target requested: unknown({})", info);
-            }
+            otro => panic!("{otro:?}"),
         }
-    });
-    handler_ids.lock().unwrap().push(h);
-
-    info!("Drag targets configured");
-
-    let drag_context = widget
-        .drag_begin_with_coordinates(&target_list, drag_action, 1, None, -1, -1)
-        .ok_or_else(|| {
-            Error::Drag("failed to initiate drag".into())
-        })?;
-
-    info!("Drag context created");
-
-    if let Some(pixbuf) = icon {
-        drag_context.drag_set_icon_pixbuf(&pixbuf, 0, 0);
     }
 
-    let w = widget.clone();
-    let ids = handler_ids.clone();
-    let ch_drop = on_event.clone();
-    drag_context.connect_drop_performed(move |_, _| {
-        info!("Drag drop performed");
-        let _ = ch_drop.send(CallbackResult {
-            result: DragResult::Dropped,
-            cursor_pos: CursorPosition { x: 0.0, y: 0.0 },
-        });
-        cleanup(&w, &ids);
-    });
-
-    let w = widget.clone();
-    let ids = handler_ids.clone();
-    widget.connect_drag_failed(move |_, _, _| {
-        warn!("Drag failed or was cancelled");
-        let _ = on_event.send(CallbackResult {
-            result: DragResult::Cancelled,
-            cursor_pos: CursorPosition { x: 0.0, y: 0.0 },
-        });
-        cleanup(&w, &ids);
-        gtk::glib::Propagation::Proceed
-    });
-
-    info!("GDK drag initiated successfully");
-    Ok(())
-}
-
-fn cleanup(
-    widget: &gtk::Widget,
-    handler_ids: &Arc<Mutex<Vec<gtk::glib::SignalHandlerId>>>,
-) {
-    let mut ids = handler_ids.lock().unwrap();
-    for id in ids.drain(..) {
-        widget.disconnect(id);
+    #[test]
+    fn los_datos_sueltos_se_entregan_de_verdad() {
+        // La API de JS los ofrecía y el lado Rust los convertía en `None`: el
+        // arrastre salía sin ningún contenido.
+        let c = contenido_de(item(r#"{"data":"hola","types":["text/plain","text/html"]}"#));
+        match c {
+            Contenido::Datos(e) => {
+                assert_eq!(e.len(), 2);
+                assert_eq!(e[0], (PRIMER_TARGET_PROPIO, "text/plain".into(), "hola".into()));
+                assert_eq!(e[1], (PRIMER_TARGET_PROPIO + 1, "text/html".into(), "hola".into()));
+            }
+            otro => panic!("{otro:?}"),
+        }
     }
-    widget.drag_source_unset();
+
+    #[test]
+    fn un_mapa_de_datos_le_da_a_cada_tipo_lo_suyo() {
+        let c = contenido_de(item(
+            r#"{"data":{"text/plain":"llano","text/html":"<b>rico</b>"},"types":["text/plain","text/html"]}"#,
+        ));
+        match c {
+            Contenido::Datos(e) => {
+                assert_eq!(e[0].2, "llano");
+                assert_eq!(e[1].2, "<b>rico</b>");
+            }
+            otro => panic!("{otro:?}"),
+        }
+    }
+
+    #[test]
+    fn un_tipo_sin_datos_en_el_mapa_no_rompe_el_arrastre() {
+        let c = contenido_de(item(
+            r#"{"data":{"text/plain":"llano"},"types":["text/plain","text/html"]}"#,
+        ));
+        match c {
+            Contenido::Datos(e) => {
+                assert_eq!(e[0].2, "llano");
+                assert_eq!(e[1].2, "", "vacío, no ausente");
+            }
+            otro => panic!("{otro:?}"),
+        }
+    }
+
+    #[test]
+    fn los_identificadores_propios_no_chocan_con_los_de_archivos() {
+        // Si un tipo propio reusara el identificador de `text/uri-list`, el destino
+        // pediría archivos y `drag-data-get` le entregaría texto.
+        let c = contenido_de(item(
+            r#"{"data":"x","types":["a/1","a/2","a/3","a/4","a/5"]}"#,
+        ));
+        let reservados = [URI_TARGET_ID, TEXT_TARGET_ID];
+        for (mime, id) in objetivos_de(&c) {
+            assert!(!reservados.contains(&id), "{mime} reusa el identificador {id}");
+        }
+    }
+
+    #[test]
+    fn los_objetivos_de_archivos_incluyen_texto_para_quien_no_entiende_uris() {
+        // Un campo de texto o una terminal aceptan `text/plain` y no
+        // `text/uri-list`; sin ofrecer los dos, arrastrar a una terminal no hace
+        // nada.
+        let objetivos = objetivos_de(&Contenido::Uris {
+            uris: vec!["file:///a".into()],
+            rutas: vec![std::path::PathBuf::from("/a")],
+        });
+        let id_de = |n: &str| objetivos.iter().find(|(m, _)| m == n).map(|(_, i)| *i);
+        assert_eq!(id_de("text/uri-list"), Some(URI_TARGET_ID));
+        assert_eq!(id_de("text/plain"), Some(TEXT_TARGET_ID));
+        assert_eq!(id_de("text/plain;charset=utf-8"), Some(TEXT_TARGET_ID));
+    }
+
+    #[test]
+    fn los_objetivos_de_datos_son_los_tipos_que_se_pidieron() {
+        let c = contenido_de(item(r#"{"data":"x","types":["application/x-vasak"]}"#));
+        let objetivos = objetivos_de(&c);
+        assert_eq!(objetivos, vec![("application/x-vasak".to_string(), PRIMER_TARGET_PROPIO)]);
+        // Y no se ofrece `text/uri-list`, que prometería archivos que no hay.
+        assert!(!objetivos.iter().any(|(m, _)| m == "text/uri-list"));
+    }
+
+    #[test]
+    fn una_ruta_de_icono_se_carga_como_ruta_y_no_como_base64() {
+        // El defecto original: `Image` es untagged con dos variantes de `String`,
+        // así que una ruta entraba como `Base64`, la decodificación fallaba y el
+        // arrastre nunca tenía icono. Ahora decide el contenido.
+        let base = std::env::temp_dir().join(format!("dnd-icono-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let png = base.join("icono.png");
+
+        // Un PNG de 1x1 de verdad: `PixbufLoader` rechaza cualquier otra cosa.
+        let bytes: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&png, &bytes).unwrap();
+
+        assert!(cargar_icono(png.to_str().unwrap()).is_some(), "por ruta");
+
+        // Y en base64 también, que es la otra forma que ofrece la API.
+        let en_base64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+        assert!(cargar_icono(&en_base64).is_some(), "en base64");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn un_icono_que_no_existe_no_rompe_el_arrastre() {
+        // El gestor de archivos pedía `icons/32x32.png`, un archivo que no está en
+        // el paquete. Sin icono se arrastra igual.
+        assert!(cargar_icono("/no/existe/icono.png").is_none());
+        assert!(cargar_icono("").is_none());
+        assert!(cargar_icono("no-es-base64-ni-ruta!!").is_none());
+    }
+
+    #[test]
+    fn se_ofrecen_copiar_y_mover_aunque_se_pida_una() {
+        // Es el defecto medido: el destino elige entre lo que el origen ofrece, y
+        // sin nada en común el compositor cancela el arrastre en lugar de
+        // entregarlo. Con sólo `MOVE`, arrastrar a un editor mostraba el borde
+        // punteado y después fallaba sin pedir un byte.
+        for modo in [DragMode::Copy, DragMode::Move] {
+            let a = acciones_de(modo);
+            assert!(a.contains(DragAction::COPY), "falta copiar en {modo:?}");
+            assert!(a.contains(DragAction::MOVE), "falta mover en {modo:?}");
+        }
+    }
+
+    #[test]
+    fn no_se_ofrece_una_accion_que_no_sabemos_cumplir() {
+        // `LINK` haría que el destino cree un enlace simbólico esperando que el
+        // origen colabore, y no hay nada de eso implementado.
+        let a = acciones_de(DragMode::Copy);
+        assert!(!a.contains(DragAction::LINK));
+        assert!(!a.contains(DragAction::ASK));
+    }
+
+    #[test]
+    fn la_accion_informada_es_la_que_negocio_el_destino() {
+        assert_eq!(nombre_de_accion(DragAction::COPY), Some("copy"));
+        assert_eq!(nombre_de_accion(DragAction::MOVE), Some("move"));
+        assert_eq!(nombre_de_accion(DragAction::empty()), None);
+    }
+
+    #[test]
+    fn con_las_dos_puestas_se_informa_la_mas_fuerte() {
+        // No debería pasar —el destino elige una— pero informar «copy» cuando hubo
+        // un movimiento dejaría el original donde estaba sin que nada lo dijera.
+        assert_eq!(
+            nombre_de_accion(DragAction::COPY | DragAction::MOVE),
+            Some("move")
+        );
+    }
+
+    #[test]
+    fn una_accion_que_no_ofrecemos_no_se_informa_como_nuestra() {
+        // `LINK` y `ASK` no se ofrecen; si llegaran, no son ni copiar ni mover.
+        assert_eq!(nombre_de_accion(DragAction::LINK), None);
+        assert_eq!(nombre_de_accion(DragAction::ASK), None);
+    }
+
+    #[test]
+    fn cada_armado_lleva_su_propia_ficha() {
+        // Sin ficha, dos arrastres armados dentro de la ventana de validez chocan:
+        // el temporizador del primero se lleva puesto el segundo, que estaba a
+        // punto de dispararse, y el arrastre se cancela sin motivo aparente.
+        let a = PROXIMA_FICHA.with(|f| {
+            let mut f = f.borrow_mut();
+            *f += 1;
+            *f
+        });
+        let b = PROXIMA_FICHA.with(|f| {
+            let mut f = f.borrow_mut();
+            *f += 1;
+            *f
+        });
+        assert_ne!(a, b);
+        assert!(b > a, "las fichas no se reusan");
+    }
+
+    #[test]
+    fn un_arrastre_que_fallo_nunca_borra() {
+        // Lo primero y lo más importante: si el destino no se quedó con nada,
+        // borrar sería perder un archivo que no está en ninguna otra parte. El
+        // fallo manda incluso sobre un pedido explícito de borrado.
+        assert!(!debe_borrar_el_origen(true, false, DragAction::MOVE));
+        assert!(!debe_borrar_el_origen(true, true, DragAction::MOVE));
+        assert!(!debe_borrar_el_origen(true, false, DragAction::COPY));
+    }
+
+    #[test]
+    fn mover_sin_fallo_saca_el_original_de_su_lugar() {
+        // En Wayland no hay ninguna señal que pida el borrado: `drag-data-delete`
+        // no se emite. Lo que hay es `dnd_finished` contra `cancelled`, que GTK
+        // traduce a `drag-end` contra `drag-failed`. Medido: sin esto, mover no
+        // movía nunca.
+        assert!(debe_borrar_el_origen(false, false, DragAction::MOVE));
+    }
+
+    #[test]
+    fn copiar_deja_el_original_donde_esta() {
+        assert!(!debe_borrar_el_origen(false, false, DragAction::COPY));
+        assert!(!debe_borrar_el_origen(false, false, DragAction::empty()));
+    }
+
+    #[test]
+    fn el_pedido_explicito_de_x11_sigue_valiendo() {
+        // En X11 `drag-data-delete` sí llega, y es más explícito que deducirlo de
+        // la acción: si llega, se respeta.
+        assert!(debe_borrar_el_origen(false, true, DragAction::COPY));
+    }
 }

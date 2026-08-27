@@ -15,7 +15,7 @@ Plugin de Tauri para iniciar operaciones de arrastrar y soltar (drag & drop) en 
 
 ```toml
 [dependencies]
-tauri-plugin-drag-and-drop-wayland = "0.1"
+tauri-plugin-drag-and-drop-wayland = "2.1"
 ```
 
 ### 2. Agregar el plugin en `lib.rs`
