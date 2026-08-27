@@ -6,6 +6,7 @@ use tauri::{
 mod commands;
 mod error;
 mod models;
+mod uri;
 
 pub use error::Error;
 pub use models::*;
