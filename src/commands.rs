@@ -55,8 +55,13 @@ const PRIMER_TARGET_PROPIO: u32 = 2;
 /// Lo que se va a entregar cuando el destino lo pida.
 #[derive(Debug, Clone)]
 pub enum Contenido {
-    /// Archivos, ya como URIs codificados.
-    Uris(Vec<String>),
+    /// Archivos: los URIs codificados para `text/uri-list` **y** las rutas tal
+    /// cual para `text/plain`. Hacen falta las dos: un destino de texto pega lo
+    /// que recibe, y un URI codificado pegado no es ningún archivo.
+    Uris {
+        uris: Vec<String>,
+        rutas: Vec<PathBuf>,
+    },
     /// Datos sueltos: para cada identificador, su tipo MIME y su texto.
     Datos(Vec<(u32, String, String)>),
 }
@@ -75,6 +80,8 @@ struct EnCurso {
     canal: Channel<CallbackResult>,
     /// Si ya se avisó el final. `drag-failed` y `drag-end` pueden llegar los dos.
     avisado: bool,
+    /// Si llegó `drag-data-delete`, o sea si el destino pidió el borrado.
+    piden_borrar: bool,
 }
 
 thread_local! {
@@ -156,18 +163,20 @@ pub fn cargar_icono(valor: &str) -> Option<gdk_pixbuf::Pixbuf> {
 /// Rust los convertía en `None`, así que el arrastre salía sin nada.
 pub fn contenido_de(item: DragItem) -> Contenido {
     match item {
-        DragItem::Files(rutas) => Contenido::Uris(
-            rutas
-                .iter()
-                .filter_map(|r| {
-                    let u = uri::de_ruta(r);
-                    if u.is_none() {
+        DragItem::Files(rutas) => {
+            let validas: Vec<(String, PathBuf)> = rutas
+                .into_iter()
+                .filter_map(|r| match uri::de_ruta(&r) {
+                    Some(u) => Some((u, r)),
+                    None => {
                         warn!("se descarta una ruta que no da un URI: {}", r.display());
+                        None
                     }
-                    u
                 })
-                .collect(),
-        ),
+                .collect();
+            let (uris, rutas) = validas.into_iter().unzip();
+            Contenido::Uris { uris, rutas }
+        }
         DragItem::Data { data, mime_types } => {
             let textos: Vec<String> = match data {
                 SharedData::Fixed(t) => mime_types.iter().map(|_| t.clone()).collect(),
@@ -214,7 +223,7 @@ pub fn objetivos_de(contenido: &Contenido) -> Vec<(String, u32)> {
         // El texto además de los URIs: un campo de texto o una terminal aceptan
         // `text/plain` y no `text/uri-list`. Ofreciendo sólo uno, arrastrar ahí no
         // hace nada.
-        Contenido::Uris(_) => vec![
+        Contenido::Uris { .. } => vec![
             ("text/uri-list".to_string(), URI_TARGET_ID),
             ("text/plain".to_string(), TEXT_TARGET_ID),
             ("text/plain;charset=utf-8".to_string(), TEXT_TARGET_ID),
@@ -235,8 +244,23 @@ fn lista_de_objetivos(contenido: &Contenido) -> gtk::TargetList {
     lista
 }
 
+/// El nombre de la acción que negoció el destino.
+///
+/// `MOVE` primero: si por algún motivo llegaran las dos, informar la más fuerte es
+/// lo honesto. Igual no es esto lo que autoriza borrar —eso es `drag-data-delete`—
+/// así que equivocarse acá no cuesta un archivo.
+pub fn nombre_de_accion(accion: DragAction) -> Option<&'static str> {
+    if accion.contains(DragAction::MOVE) {
+        Some("move")
+    } else if accion.contains(DragAction::COPY) {
+        Some("copy")
+    } else {
+        None
+    }
+}
+
 /// Avisa el final del arrastre una sola vez.
-fn avisar(resultado: DragResult) {
+fn avisar(resultado: DragResult, accion: Option<DragAction>) {
     EN_CURSO.with(|c| {
         if let Some(curso) = c.borrow_mut().as_mut() {
             if curso.avisado {
@@ -245,6 +269,8 @@ fn avisar(resultado: DragResult) {
             curso.avisado = true;
             let _ = curso.canal.send(CallbackResult {
                 result: resultado,
+                action: accion.and_then(nombre_de_accion).map(str::to_string),
+                source_should_delete: curso.piden_borrar,
                 cursor_pos: CursorPosition { x: 0.0, y: 0.0 },
             });
         }
@@ -283,6 +309,8 @@ fn enganchar(widget: &gtk::Widget, etiqueta: &str) {
                 debug!("el botón se soltó antes de arrancar el arrastre");
                 let _ = perdido.canal.send(CallbackResult {
                     result: DragResult::Cancelled,
+                    action: None,
+                    source_should_delete: false,
                     cursor_pos: CursorPosition { x: 0.0, y: 0.0 },
                 });
             }
@@ -305,12 +333,14 @@ fn enganchar(widget: &gtk::Widget, etiqueta: &str) {
             // `set_text` y `set_uris` devuelven si pudieron. Ignorarlo es cómo se
             // llega a un arrastre que se ve bien y entrega vacío sin decir nada.
             let puesto = match &curso.contenido {
-                Contenido::Uris(uris) => match info {
+                Contenido::Uris { uris, rutas } => match info {
                     URI_TARGET_ID => {
                         let refs: Vec<&str> = uris.iter().map(String::as_str).collect();
                         data.set_uris(&refs)
                     }
-                    TEXT_TARGET_ID => data.set_text(&uri::lista(uris)),
+                    // Las rutas tal cual, no los URIs: quien toma `text/plain` pega
+                    // lo que recibe, y un URI codificado pegado no es un archivo.
+                    TEXT_TARGET_ID => data.set_text(&uri::rutas_como_texto(rutas)),
                     otro => {
                         debug!("objetivo desconocido: {otro}");
                         return;
@@ -340,16 +370,29 @@ fn enganchar(widget: &gtk::Widget, etiqueta: &str) {
             contexto.selected_action(),
             contexto.actions()
         );
-        avisar(DragResult::Cancelled);
+        avisar(DragResult::Cancelled, Some(contexto.selected_action()));
         gtk::glib::Propagation::Proceed
+    });
+
+    // El destino pidió el borrado del original: es la señal de que la entrega
+    // salió bien y que el movimiento le toca al origen. Se anota y se informa en
+    // `drag-end`; borrar archivos del usuario no es cosa de un plugin de arrastre.
+    widget.connect_drag_data_delete(|_, _| {
+        EN_CURSO.with(|c| {
+            if let Some(curso) = c.borrow_mut().as_mut() {
+                curso.piden_borrar = true;
+            }
+        });
+        debug!("el destino pidió borrar el original");
     });
 
     // `drag-end` es el final de verdad, y llega **después** de que se entregaron
     // los datos. Acá sí se puede soltar todo.
-    widget.connect_drag_end(|_, _| {
-        avisar(DragResult::Dropped);
+    widget.connect_drag_end(|_, contexto| {
+        let accion = contexto.selected_action();
+        avisar(DragResult::Dropped, Some(accion));
         EN_CURSO.with(|c| *c.borrow_mut() = None);
-        debug!("arrastre terminado");
+        debug!("arrastre terminado (acción {accion:?})");
     });
 }
 
@@ -362,6 +405,7 @@ fn arrancar(widget: &gtk::Widget, listo: Armado) {
             contenido: listo.contenido.clone(),
             canal: listo.canal.clone(),
             avisado: false,
+            piden_borrar: false,
         })
     });
 
@@ -381,7 +425,7 @@ fn arrancar(widget: &gtk::Widget, listo: Armado) {
             // No debería pasar desde acá, pero si pasa hay que decirlo: en silencio
             // parece que el arrastre salió y no llegó nunca.
             warn!("GTK no pudo iniciar el arrastre");
-            avisar(DragResult::Cancelled);
+            avisar(DragResult::Cancelled, None);
             EN_CURSO.with(|c| *c.borrow_mut() = None);
         }
     }
@@ -439,6 +483,8 @@ pub async fn start_drag<R: Runtime>(
                             debug!("el arrastre armado venció sin que llegara un movimiento");
                             let _ = perdido.canal.send(CallbackResult {
                                 result: DragResult::Cancelled,
+                                action: None,
+                                source_should_delete: false,
                                 cursor_pos: CursorPosition { x: 0.0, y: 0.0 },
                             });
                         }
@@ -471,9 +517,11 @@ mod tests {
         // con un espacio era un URI inválido y el destino lo rechazaba.
         let c = contenido_de(item(r#"["/tmp/mi archivo.txt","/tmp/otro.png"]"#));
         match c {
-            Contenido::Uris(u) => {
-                assert_eq!(u[0], "file:///tmp/mi%20archivo.txt");
-                assert_eq!(u[1], "file:///tmp/otro.png");
+            Contenido::Uris { uris, rutas } => {
+                assert_eq!(uris[0], "file:///tmp/mi%20archivo.txt");
+                assert_eq!(uris[1], "file:///tmp/otro.png");
+                // Y las rutas tal cual, que son las que van a `text/plain`.
+                assert_eq!(rutas[0], std::path::PathBuf::from("/tmp/mi archivo.txt"));
             }
             otro => panic!("{otro:?}"),
         }
@@ -485,9 +533,11 @@ mod tests {
         // entero por una sería peor.
         let c = contenido_de(item(r#"["relativa.txt","/tmp/buena.png"]"#));
         match c {
-            Contenido::Uris(u) => {
-                assert_eq!(u.len(), 1);
-                assert_eq!(u[0], "file:///tmp/buena.png");
+            Contenido::Uris { uris, rutas } => {
+                assert_eq!(uris, vec!["file:///tmp/buena.png".to_string()]);
+                // Las dos listas quedan alineadas: si no, `text/plain` entregaría
+                // la ruta de un archivo distinto del que dice `text/uri-list`.
+                assert_eq!(rutas, vec![std::path::PathBuf::from("/tmp/buena.png")]);
             }
             otro => panic!("{otro:?}"),
         }
@@ -554,7 +604,10 @@ mod tests {
         // Un campo de texto o una terminal aceptan `text/plain` y no
         // `text/uri-list`; sin ofrecer los dos, arrastrar a una terminal no hace
         // nada.
-        let objetivos = objetivos_de(&Contenido::Uris(vec!["file:///a".into()]));
+        let objetivos = objetivos_de(&Contenido::Uris {
+            uris: vec!["file:///a".into()],
+            rutas: vec![std::path::PathBuf::from("/a")],
+        });
         let id_de = |n: &str| objetivos.iter().find(|(m, _)| m == n).map(|(_, i)| *i);
         assert_eq!(id_de("text/uri-list"), Some(URI_TARGET_ID));
         assert_eq!(id_de("text/plain"), Some(TEXT_TARGET_ID));
@@ -628,5 +681,29 @@ mod tests {
         let a = acciones_de(DragMode::Copy);
         assert!(!a.contains(DragAction::LINK));
         assert!(!a.contains(DragAction::ASK));
+    }
+
+    #[test]
+    fn la_accion_informada_es_la_que_negocio_el_destino() {
+        assert_eq!(nombre_de_accion(DragAction::COPY), Some("copy"));
+        assert_eq!(nombre_de_accion(DragAction::MOVE), Some("move"));
+        assert_eq!(nombre_de_accion(DragAction::empty()), None);
+    }
+
+    #[test]
+    fn con_las_dos_puestas_se_informa_la_mas_fuerte() {
+        // No debería pasar —el destino elige una— pero informar «copy» cuando hubo
+        // un movimiento dejaría el original donde estaba sin que nada lo dijera.
+        assert_eq!(
+            nombre_de_accion(DragAction::COPY | DragAction::MOVE),
+            Some("move")
+        );
+    }
+
+    #[test]
+    fn una_accion_que_no_ofrecemos_no_se_informa_como_nuestra() {
+        // `LINK` y `ASK` no se ofrecen; si llegaran, no son ni copiar ni mover.
+        assert_eq!(nombre_de_accion(DragAction::LINK), None);
+        assert_eq!(nombre_de_accion(DragAction::ASK), None);
     }
 }

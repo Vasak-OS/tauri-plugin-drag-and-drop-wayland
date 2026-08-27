@@ -20,15 +20,20 @@ pub fn de_ruta(ruta: &Path) -> Option<String> {
         .map(|g| g.to_string())
 }
 
-/// El cuerpo de un `text/uri-list`.
+/// Las rutas tal cual, para `text/plain`.
 ///
-/// Las líneas van separadas por CRLF, que es lo que dice el RFC 2483, y con un
-/// CRLF final: hay destinos que descartan la última línea si no lo tiene.
-pub fn lista(uris: &[String]) -> String {
-    if uris.is_empty() {
-        return String::new();
-    }
-    format!("{}\r\n", uris.join("\r\n"))
+/// **Rutas y no URIs.** Un destino que toma `text/plain` es una terminal, un campo
+/// de texto o un editor: lo que le sirve es `/home/quien/mi archivo.md`, no
+/// `file:///home/quien/mi%20archivo.md`. Mandándole el URI codificado, lo pega tal
+/// cual y no hay archivo en ninguna parte — que es exactamente lo que pasó al
+/// probarlo. Es lo que hace cualquier gestor de archivos: el URI va en
+/// `text/uri-list` y la ruta legible en `text/plain`.
+pub fn rutas_como_texto(rutas: &[std::path::PathBuf]) -> String {
+    rutas
+        .iter()
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -71,15 +76,24 @@ mod tests {
     }
 
     #[test]
-    fn la_lista_termina_en_crlf() {
-        // Hay destinos que descartan la última línea si no lo tiene.
-        let l = lista(&["file:///a".to_string(), "file:///b".to_string()]);
-        assert_eq!(l, "file:///a\r\nfile:///b\r\n");
+    fn el_texto_plano_lleva_la_ruta_y_no_el_uri() {
+        // Lo que rompía la entrega: el destino que toma `text/plain` —una
+        // terminal, un campo de texto— pegaba `file:///...%20...` tal cual, y no
+        // había archivo en ninguna parte.
+        let t = rutas_como_texto(&[PathBuf::from("/home/quien/mi archivo.md")]);
+        assert_eq!(t, "/home/quien/mi archivo.md");
+        assert!(!t.contains("file://"));
+        assert!(!t.contains("%20"));
     }
 
     #[test]
-    fn una_lista_vacia_es_vacia() {
-        // Y no un CRLF suelto, que se lee como un URI vacío.
-        assert_eq!(lista(&[]), "");
+    fn varias_rutas_van_una_por_linea() {
+        let t = rutas_como_texto(&[PathBuf::from("/a/uno.txt"), PathBuf::from("/b/dos.txt")]);
+        assert_eq!(t, "/a/uno.txt\n/b/dos.txt");
+    }
+
+    #[test]
+    fn sin_rutas_no_hay_texto() {
+        assert_eq!(rutas_como_texto(&[]), "");
     }
 }

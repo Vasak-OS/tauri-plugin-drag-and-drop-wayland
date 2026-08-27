@@ -58,6 +58,17 @@ pub enum DragResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct CallbackResult {
     pub result: DragResult,
+    /// La acción que negoció el destino: `"copy"` o `"move"`. Informativa.
+    pub action: Option<String>,
+    /// Si el destino pidió que el origen borre lo que entregó.
+    ///
+    /// **Esta es la señal que autoriza borrar, y no `action`.** Un destino puede
+    /// elegir mover y después no pedir el borrado —porque falló al guardar, o
+    /// porque cambió de idea—, y borrar por haber visto «move» sería perder un
+    /// archivo que nadie copió a ninguna parte. GTK emite `drag-data-delete` sólo
+    /// cuando la entrega salió bien y corresponde borrar.
+    #[serde(rename = "sourceShouldDelete")]
+    pub source_should_delete: bool,
     #[serde(rename = "cursorPos")]
     pub cursor_pos: CursorPosition,
 }

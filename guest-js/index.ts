@@ -18,6 +18,17 @@ export interface DragOptions {
 
 export interface CallbackPayload {
   result: DragResult;
+  /** La acción que negoció el destino. Informativa. */
+  action: "copy" | "move" | null;
+  /**
+   * Si el destino pidió que el origen borre lo que entregó.
+   *
+   * **Esta es la señal que autoriza borrar, y no `action`.** Un destino puede
+   * elegir mover y después no pedir el borrado —porque falló al guardar, o porque
+   * cambió de idea— y borrar por haber visto «move» sería perder un archivo que
+   * nadie copió a ninguna parte.
+   */
+  sourceShouldDelete: boolean;
   cursorPos: CursorPosition;
 }
 
